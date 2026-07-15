@@ -1,0 +1,4 @@
+# VBIOS images are AMD copyrighted firmware and are card-specific — never commit
+*.rom
+*.bin
+__pycache__/

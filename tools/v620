@@ -1,0 +1,113 @@
+#!/bin/bash
+# v620 — AMD Radeon Pro V620 control helper (run inside the guest VM)
+#
+# Core-clock/power control works via OverDrive ONLY because the VM boots with a
+# patched VBIOS image (hostpci0 romfile=v620-odcaps.rom on the Proxmox host)
+# that enables the OD cap bits in the PowerPlay table. Without that romfile,
+# OD disappears and the core is firmware-fixed. GFX DPM stays refused by the
+# SMU either way, so the sclk *sensor* always reads 0 MHz — use benchmark
+# throughput or power draw to confirm clock changes.
+#
+# !! NEVER write to pp_features or the pp_table sysfs file on this card —
+# !! both wedge the SMU; recovery requires a full Proxmox HOST reboot (no FLR).
+set -euo pipefail
+
+D=/sys/class/drm/card0/device
+PM=/sys/kernel/debug/dri/0/amdgpu_pm_info
+HW=$(ls -d "$D"/hwmon/hwmon* | head -1)
+
+usage() {
+    cat <<EOF
+Usage: v620 <command>
+
+  status                Show clocks, temperature, power, fan-less card temps
+  core <500-2650>       Set core clock soft max in MHz (OverDrive; stock 2364)
+  core reset            Restore stock OverDrive clocks
+  vram <674-1075>       Set VRAM clock max in MHz (OverDrive; stock 1000)
+  power <232-275>       Set power cap in watts (stock 250)
+  mem <96|456|673|1000> Force memory clock DPM level (MHz)
+  mem auto              Return memory clock to automatic management
+  profile               List power profiles (current marked *)
+  profile <0-6|name>    Set profile: bootup_default 3d_full_screen
+                        power_saving video vr compute custom
+  levels                Show raw sclk/mclk DPM level tables + OD table
+  watch                 Live status every 2s (Ctrl-C to stop)
+EOF
+    exit 1
+}
+
+status() {
+    echo "== AMD Radeon Pro V620 =="
+    grep -E "MHz|W \(|mV" "$PM" 2>/dev/null | sed 's/^\s*/  /' || true
+    echo "  Temp:  $(( $(cat "$HW/temp1_input") / 1000 ))°C (edge)  $(( $(cat "$HW/temp2_input" 2>/dev/null || echo 0) / 1000 ))°C (junction)  $(( $(cat "$HW/temp3_input" 2>/dev/null || echo 0) / 1000 ))°C (mem)"
+    echo "  Perf level: $(cat "$D/power_dpm_force_performance_level")"
+    echo "  GPU load:   $(cat "$D/gpu_busy_percent" 2>/dev/null || echo '?')%"
+    echo "  VRAM used:  $(( $(cat "$D/mem_info_vram_used") / 1048576 )) / $(( $(cat "$D/mem_info_vram_total") / 1048576 )) MiB"
+    echo "  Mem clock:  $(grep '\*' "$D/pp_dpm_mclk" | sed 's/.*: //;s/ \*//')"
+}
+
+od_write() {
+    echo "$1" > "$D/pp_od_clk_voltage" && echo c > "$D/pp_od_clk_voltage"
+}
+
+case "${1:-}" in
+status) status ;;
+levels)
+    echo "-- pp_dpm_sclk (core; sensor always 0Mhz, DPM firmware-refused)"
+    cat "$D/pp_dpm_sclk"
+    echo "-- pp_dpm_mclk (memory)"
+    cat "$D/pp_dpm_mclk"
+    echo "-- pp_od_clk_voltage (OverDrive, needs romfile)"
+    cat "$D/pp_od_clk_voltage"
+    ;;
+core)
+    case "${2:-}" in
+    reset) echo r > "$D/pp_od_clk_voltage"; echo c > "$D/pp_od_clk_voltage"; echo "core clocks: stock (max 2364 MHz)" ;;
+    *)
+        [[ "${2:-}" =~ ^[0-9]+$ ]] && [ "$2" -ge 500 ] && [ "$2" -le 2650 ] || usage
+        od_write "s 1 $2" && echo "core clock soft max: $2 MHz"
+        ;;
+    esac
+    ;;
+vram)
+    [[ "${2:-}" =~ ^[0-9]+$ ]] && [ "$2" -ge 674 ] && [ "$2" -le 1075 ] || usage
+    od_write "m 1 $2" && echo "VRAM clock max: $2 MHz"
+    ;;
+power)
+    [[ "${2:-}" =~ ^[0-9]+$ ]] && [ "$2" -ge 232 ] && [ "$2" -le 275 ] || usage
+    echo "$(( $2 * 1000000 ))" > "$HW/power1_cap" && echo "power cap: $2 W"
+    ;;
+mem)
+    case "${2:-}" in
+    auto) echo auto > "$D/power_dpm_force_performance_level"; echo "memory clock: auto" ;;
+    96|456|673|1000)
+        lvl=$(grep -n "${2}Mhz" "$D/pp_dpm_mclk" | cut -d: -f1)
+        [ -n "$lvl" ] || { echo "level ${2}MHz not found"; exit 1; }
+        echo manual > "$D/power_dpm_force_performance_level"
+        echo $((lvl - 1)) > "$D/pp_dpm_mclk"
+        echo "memory clock forced to ${2} MHz (level $((lvl - 1)))"
+        ;;
+    *) usage ;;
+    esac
+    ;;
+profile)
+    if [ -z "${2:-}" ]; then
+        awk 'NR==1{next} /^ *[0-6] /{print $1, $2}' "$D/pp_power_profile_mode"
+    else
+        case "${2,,}" in
+        bootup_default) n=0 ;; 3d_full_screen) n=1 ;; power_saving) n=2 ;;
+        video) n=3 ;; vr) n=4 ;; compute) n=5 ;; custom) n=6 ;;
+        [0-6]) n=$2 ;;
+        *) usage ;;
+        esac
+        # profile writes need manual perf level on smu11
+        echo manual > "$D/power_dpm_force_performance_level"
+        echo "$n" > "$D/pp_power_profile_mode"
+        echo "profile set to $n"
+    fi
+    ;;
+watch)
+    while true; do clear; date; status; sleep 2; done
+    ;;
+*) usage ;;
+esac
