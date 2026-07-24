@@ -53,6 +53,10 @@ patched PowerPlay table included — during its normal boot init and hands it to
 the SMU at the one moment the firmware accepts it. No flash, no runtime reset.
 Delete `romfile=` and everything reverts.
 
+Not using a VM? The same delivery idea has a baremetal equivalent that feeds the
+driver a patched image at boot without `romfile=` and without flashing — see
+[Baremetal (no VM) variant](#baremetal-no-vm-variant--acpi-vfct-override) below.
+
 ## Requirements
 
 - V620 passed through to a Linux VM. Tested on Proxmox 9.1 with an Ubuntu
@@ -60,6 +64,12 @@ Delete `romfile=` and everything reverts.
   plain QEMU/libvirt works the same way.
 - Root on host and guest.
 - The GPU already working in the guest (amdgpu bound, ROCm/Vulkan functional).
+
+# Passthrough VM — step by step
+
+This is the tested path (Proxmox + Ubuntu guest). For a machine running amdgpu
+directly on the metal, skip to [Baremetal (no VM)
+variant](#baremetal-no-vm-variant--acpi-vfct-override).
 
 ## Step 1 — enable OverDrive in the guest kernel
 
@@ -179,6 +189,133 @@ To control it from a desktop GUI on your LAN, add to the `daemon:` section of
 restart `lactd`, and use *Connect to remote daemon* in the GUI. `lactd`
 re-applies saved settings at boot, making tuning persistent. Only expose the
 port on a trusted LAN — the daemon has no authentication.
+
+# Baremetal (no VM) variant — ACPI VFCT override
+
+> **Status: untested / experimental.** Unlike the passthrough flow above (which
+> is battle-proven), this section is derived from the amdgpu source and the
+> kernel's documented ACPI-override mechanism but has **not** been verified on
+> real hardware here. Try it only with a known-good recovery boot ready, and
+> please open an issue with results. The same **no-FLR wedge danger** applies —
+> re-read the [Warnings](#-warnings) first.
+
+Without a hypervisor there's no `romfile=` — but you don't need one. On a
+**discrete** GPU, amdgpu looks for its VBIOS in a fixed order:
+
+```
+ATRM (ACPI)  →  VFCT (ACPI table)  →  VRAM BAR  →  ROM BAR  →  …
+```
+
+`VFCT` is an ACPI table that can carry the whole VBIOS image, and it is consulted
+**before** the card's physical ROM BAR. amdgpu matches a VFCT image to a card by
+PCI **vendor + device + slot + function**. So if you inject a VFCT whose embedded
+image is your *patched* dump, the driver reads the patched PowerPlay table at
+init and hands it to the SMU exactly as `romfile=` does in a VM — no flash, no
+runtime `pp_table` write, nothing written to the card. The kernel lets you inject
+an ACPI table from the initramfs via `CONFIG_ACPI_TABLE_UPGRADE`.
+
+Why not just flash the patched image instead? You can't — RDNA2 VBIOSes are PSP
+signed, so an unsigned modified image is rejected at flash time (only the signed
+W6800 image flashes, and that costs 12 CUs). VFCT delivery works precisely
+*because* it's a boot-time read, not a flash: the SMU accepts an unsigned
+PowerPlay table at init, the same window the VM route uses.
+
+### Step 1 — kernel flag (host)
+
+Same as the VM's Step 1, but on the baremetal host's bootloader:
+
+```bash
+# /etc/default/grub  →  GRUB_CMDLINE_LINUX_DEFAULT="... amdgpu.ppfeaturemask=0xffffffff"
+sudo update-grub   # (or grub-mkconfig; on systemd-boot edit the entry's options=)
+```
+
+GRUB's role stops here — it passes the flag and loads the initramfs. It cannot
+inject a VBIOS itself; option-ROM shadowing happens in firmware before GRUB runs.
+
+### Step 2 — dump and patch (host)
+
+Exactly the VM's Steps 2–3, run on the metal:
+
+```bash
+sudo cat /sys/kernel/debug/dri/0/amdgpu_vbios > v620_vbios.rom   # pick the right dri index
+python3 make_odcaps_rom.py v620_vbios.rom                        # -> v620-odcaps.rom
+```
+
+### Step 3 — wrap the patched ROM in a VFCT table
+
+This is the fiddly part and the reason the section is experimental — there's no
+turnkey tool. A VFCT is a standard ACPI table (`'VFCT'` signature + 36-byte ACPI
+header) followed by a GOP image directory; each image entry has a header
+carrying the target **PCI bus / device / function**, vendor/device IDs,
+subsystem IDs, revision and image length, immediately followed by the raw VBIOS
+bytes. To build one:
+
+- one image entry per card (a single VFCT can hold **both** V620s — give each
+  entry that card's bus/dev/fn and its own patched image);
+- set each entry's vendor/device to `1002:73a1` and the bus/dev/fn to match
+  `lspci`;
+- append the patched ROM bytes as the image body and set `ImageLength`;
+- fix the ACPI table checksum (whole table sums to 0 mod 256) and `Length`.
+
+The kernel's `struct acpi_vfct` / image-header layout in
+[`amdgpu_acpi_vfct_bios()`](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/amd/amdgpu/amdgpu_bios.c)
+is the authoritative field reference. Save the result as `vfct.aml`.
+
+### Step 4 — inject the table via initramfs
+
+The kernel reads override tables from an **uncompressed** cpio prepended to the
+initrd, at the fixed path `kernel/firmware/acpi/`:
+
+```bash
+mkdir -p kernel/firmware/acpi
+cp vfct.aml kernel/firmware/acpi/
+find kernel | cpio -H newc --create > acpi_override.cpio   # do NOT compress this cpio
+```
+
+Prepend it to your initramfs and boot with `CONFIG_ACPI_TABLE_UPGRADE` enabled
+(and `ACPI_TABLE_UPGRADE_VIA_BUILTIN_INITRD` if the initrd is built into the
+kernel). Distros differ on how the extra cpio is attached — some let you list it
+as an early-microcode-style initrd, others want it concatenated ahead of the
+real initramfs image. See the kernel doc
+[*Upgrading ACPI tables via initrd*](https://docs.kernel.org/admin-guide/acpi/initrd_table_override.html).
+
+### Step 5 — verify
+
+After reboot, confirm the driver actually took the VFCT image and not the ROM
+BAR:
+
+```bash
+sudo dmesg | grep -i vbios     # expect "Fetched VBIOS from VFCT" (not "from ROM BAR")
+cat /sys/class/drm/card0/device/pp_od_clk_voltage   # same OD_RANGE as the VM route
+```
+
+From here everything is identical to the VM path — the same `pp_od_clk_voltage`
+writes, the same `tools/v620` helper, the same LACT setup.
+
+### Baremetal caveats
+
+- **ATRM is tried first.** It exists mainly on switchable-graphics laptops; on
+  desktop/server boards it's normally absent, so VFCT is reached. If `dmesg`
+  shows the VBIOS came from ATRM, that path is winning and you'll need to disable
+  it or fall back to a different board.
+- **Recovery is a reboot, not a config edit.** There's no `romfile=` to delete —
+  if a bad table hangs GPU init, drop the cpio override and reboot from a spare
+  entry. The no-FLR wedge rule below still bites.
+- If VFCT delivery proves impractical on your board, the remaining options are
+  the **W6800 signed cross-flash** (permanent, −12 CUs) or a tiny **amdgpu
+  source/DKMS patch** that forces `cap[0..3]` after the VBIOS parse (safe and
+  clean, but a kernel-module build you carry across updates).
+
+> **Disclaimer.** The baremetal steps above are a general outline, not a
+> copy-paste recipe. VFCT layout, initramfs handling, bootloader syntax and
+> kernel config vary by board, distro and card revision, so expect to adapt them
+> to your setup — and understand each step before running it, since a wrong
+> PowerPlay table can wedge the SMU (see the warnings below). If you get stuck
+> adapting the details (building the `vfct.aml`, wiring the initramfs cpio,
+> reading the amdgpu source), an LLM such as [Claude](https://claude.ai) is a
+> good assistant for fitting these instructions to your specific hardware and
+> distro. Verify its output against the linked kernel docs and source before you
+> boot with it.
 
 ## ⚠️ Warnings
 
